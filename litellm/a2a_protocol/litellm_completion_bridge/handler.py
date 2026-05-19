@@ -37,6 +37,7 @@ class A2ACompletionBridgeHandler:
         params: Dict[str, Any],
         litellm_params: Dict[str, Any],
         api_base: Optional[str] = None,
+        agent_extra_headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         Handle non-streaming A2A request via litellm.acompletion.
@@ -46,6 +47,8 @@ class A2ACompletionBridgeHandler:
             params: A2A MessageSendParams containing the message
             litellm_params: Agent's litellm_params (custom_llm_provider, model, etc.)
             api_base: API base URL from agent_card_params
+            agent_extra_headers: Per-request headers (from x-a2a-{agent}-* rewrite and
+                admin extra_headers) to forward on the upstream HTTP call.
 
         Returns:
             A2A SendMessageResponse dict
@@ -66,6 +69,7 @@ class A2ACompletionBridgeHandler:
                 params=params,
                 api_base=api_base,
                 litellm_params=litellm_params,
+                agent_extra_headers=agent_extra_headers,
             )
 
             return response_data
@@ -108,6 +112,12 @@ class A2ACompletionBridgeHandler:
         }
         completion_params.update(litellm_params_to_add)
 
+        if agent_extra_headers:
+            completion_params["extra_headers"] = {
+                **(completion_params.get("extra_headers") or {}),
+                **agent_extra_headers,
+            }
+
         # Call litellm.acompletion
         response = await litellm.acompletion(**completion_params)
 
@@ -129,6 +139,7 @@ class A2ACompletionBridgeHandler:
         params: Dict[str, Any],
         litellm_params: Dict[str, Any],
         api_base: Optional[str] = None,
+        agent_extra_headers: Optional[Dict[str, str]] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         Handle streaming A2A request via litellm.acompletion with stream=True.
@@ -166,6 +177,7 @@ class A2ACompletionBridgeHandler:
                 params=params,
                 api_base=api_base,
                 litellm_params=litellm_params,
+                agent_extra_headers=agent_extra_headers,
             ):
                 yield chunk
 
@@ -214,6 +226,12 @@ class A2ACompletionBridgeHandler:
             if k not in ("model", "custom_llm_provider") and k not in _AGENT_ONLY_PARAMS
         }
         completion_params.update(litellm_params_to_add)
+
+        if agent_extra_headers:
+            completion_params["extra_headers"] = {
+                **(completion_params.get("extra_headers") or {}),
+                **agent_extra_headers,
+            }
 
         # 1. Emit initial task event (kind: "task", status: "submitted")
         task_event = A2ACompletionBridgeTransformation.create_task_event(ctx)
