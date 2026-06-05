@@ -140,6 +140,7 @@ export const guardrailLogoMap: Record<string, string> = {
   "LiteLLM LLM as a Judge": `${asset_logos_folder}litellm_logo.jpg`,
   "Akto": `${asset_logos_folder}akto.svg`,
   "Qostodian Nexus": `${asset_logos_folder}qohash.jpg`,
+  "Straiker": `${asset_logos_folder}straiker.svg`,
 };
 
 export const getGuardrailLogoAndName = (guardrailValue: string): { logo: string; displayName: string } => {
