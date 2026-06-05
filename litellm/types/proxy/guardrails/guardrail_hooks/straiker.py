@@ -30,11 +30,6 @@ class StraikerGuardrailConfigModel(GuardrailConfigModel):
         description="Application name registered in the Straiker Defend Console.",
     )
 
-    destination: str = Field(
-        default="api.openai.com",
-        description="Identifies the downstream LLM host. Recorded in detection metadata.",
-    )
-
     threshold: float = Field(
         default=0.5,
         ge=0.0,
@@ -54,37 +49,14 @@ class StraikerGuardrailConfigModel(GuardrailConfigModel):
         description="Retries on transient HTTP (408/429/5xx) and network errors.",
     )
 
-    initial_backoff: float = Field(
-        default=0.1,
-        gt=0.0,
-        description="Initial retry backoff in seconds; doubles per attempt with full jitter.",
-    )
-
-    max_backoff: float = Field(
-        default=2.0,
-        gt=0.0,
-        description="Retry backoff ceiling in seconds.",
-    )
-
     unreachable_fallback: Literal["fail_open", "fail_closed"] = Field(
         default="fail_closed",
         description="Behavior when Straiker is unreachable after retries.",
     )
 
-    enabled_models: Optional[List[str]] = Field(
-        default=None,
-        description="Glob patterns; if set, only matching models are scored.",
-    )
-
     skip_models: Optional[List[str]] = Field(
         default=None,
         description="Glob patterns to bypass scoring (e.g., coding-agent models).",
-    )
-
-    max_payload_bytes: int = Field(
-        default=524288,
-        gt=0,
-        description="Payload size limit. Oversized requests bypass with a structured log.",
     )
 
     verbose: bool = Field(

@@ -14,6 +14,10 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from litellm.integrations.custom_guardrail import CustomGuardrail
+from litellm.llms.custom_httpx.http_handler import (
+    get_async_httpx_client,
+    httpxSpecialProvider,
+)
 
 if TYPE_CHECKING:
     from litellm.types.proxy.guardrails.guardrail_hooks.base import GuardrailConfigModel
@@ -23,7 +27,6 @@ log = logging.getLogger("straiker.guardrail")
 DEFAULT_API_BASE = "https://api.prod.straiker.ai/api/v1/detect"
 DEFAULT_MAX_PAYLOAD_BYTES = 524288
 RETRY_STATUS = frozenset({408, 429, 500, 502, 503, 504})
-UNREACHABLE_FALLBACK_ALIASES = {"allow": "fail_open", "block": "fail_closed"}
 
 
 class DetectResponse(BaseModel):
@@ -143,21 +146,18 @@ def _structured_log(level: int, event: str, **fields: Any) -> None:
         log.log(level, "%s %r", event, fields)
 
 
-def _resolve_unreachable_fallback(
-    unreachable_fallback: Optional[str], fail_open: Optional[bool]
-) -> str:
-    if unreachable_fallback is not None:
-        normalized = str(unreachable_fallback).lower()
-        normalized = UNREACHABLE_FALLBACK_ALIASES.get(normalized, normalized)
-        if normalized not in ("fail_open", "fail_closed"):
-            raise ValueError(
-                "unreachable_fallback must be 'fail_open' or 'fail_closed' "
-                f"(or alias 'allow'/'block'); got {unreachable_fallback!r}"
-            )
-        return normalized
-    if fail_open is True:
-        return "fail_open"
-    return "fail_closed"
+def _resolve_session_id(data: dict, meta: dict) -> str:
+    return (
+        meta.get("session_id")
+        or meta.get("requester_metadata", {}).get("session_id")
+        or (data.get("litellm_metadata") or {}).get("session_id")
+        or data.get("litellm_call_id")
+        or "litellm-session"
+    )
+
+
+def _resolve_user_name(data: dict, meta: dict) -> str:
+    return meta.get("user_name") or data.get("user") or "litellm"
 
 
 class StraikerGuardrail(CustomGuardrail):
@@ -178,8 +178,7 @@ class StraikerGuardrail(CustomGuardrail):
         destination: str = "api.openai.com",
         threshold: float = 0.5,
         timeout: float = 5.0,
-        fail_open: Optional[bool] = None,
-        unreachable_fallback: Optional[str] = None,
+        unreachable_fallback: str = "fail_closed",
         max_retries: int = 2,
         initial_backoff: float = 0.1,
         max_backoff: float = 2.0,
@@ -189,8 +188,15 @@ class StraikerGuardrail(CustomGuardrail):
         custom_headers: Optional[dict[str, str]] = None,
         verbose: bool = True,
         dedup_iterations: bool = True,
+        async_handler: Optional[httpx.AsyncClient] = None,
         **kwargs,
     ):
+        if unreachable_fallback not in ("fail_open", "fail_closed"):
+            raise ValueError(
+                "unreachable_fallback must be 'fail_open' or 'fail_closed'; "
+                f"got {unreachable_fallback!r}"
+            )
+
         self.api_key = api_key or os.environ.get("STRAIKER_API_KEY", "")
         self.detect_url = (
             api_base or os.environ.get("STRAIKER_API_BASE") or DEFAULT_API_BASE
@@ -200,9 +206,7 @@ class StraikerGuardrail(CustomGuardrail):
         self.destination = destination
         self.threshold = float(threshold)
         self.timeout = float(timeout)
-        self.unreachable_fallback = _resolve_unreachable_fallback(
-            unreachable_fallback, fail_open
-        )
+        self.unreachable_fallback = unreachable_fallback
         self.max_retries = max(0, int(max_retries))
         self.initial_backoff = max(0.0, float(initial_backoff))
         self.max_backoff = max(self.initial_backoff, float(max_backoff))
@@ -212,6 +216,10 @@ class StraikerGuardrail(CustomGuardrail):
         self.custom_headers = dict(custom_headers) if custom_headers else {}
         self.verbose = bool(verbose)
         self.dedup_iterations = bool(dedup_iterations)
+
+        self.async_handler = async_handler or get_async_httpx_client(
+            llm_provider=httpxSpecialProvider.GuardrailCallback,
+        )
 
         super().__init__(**kwargs)
 
@@ -242,13 +250,8 @@ class StraikerGuardrail(CustomGuardrail):
         meta = data.get("metadata") or {}
         net = meta.get("network") or {}
         model = data.get("model", "unknown") or "unknown"
-        prompt = _last_user_prompt(messages)
-        session_id = (
-            meta.get("session_id")
-            or meta.get("requester_metadata", {}).get("session_id")
-            or "litellm-session"
-        )
-        user_name = meta.get("user_name") or data.get("user") or "litellm"
+        session_id = _resolve_session_id(data, meta)
+        user_name = _resolve_user_name(data, meta)
         user_role = meta.get("user_role") or "public"
         trace_id = meta.get("trace_id")
         agent_role = meta.get("agent_role")
@@ -294,7 +297,7 @@ class StraikerGuardrail(CustomGuardrail):
                 "annotations": annotations,
             }
         return {
-            "prompt": prompt,
+            "prompt": _last_user_prompt(messages),
             "app_response": app_response or "N/A",
             "rag_content": "N/A",
             "session_id": session_id,
@@ -361,8 +364,9 @@ class StraikerGuardrail(CustomGuardrail):
         for attempt in range(attempts):
             t0 = time.monotonic()
             try:
-                async with httpx.AsyncClient(timeout=self.timeout, verify=True) as c:
-                    resp = await c.post(url, json=payload, headers=headers)
+                resp = await self.async_handler.post(
+                    url, json=payload, headers=headers, timeout=self.timeout
+                )
                 elapsed_ms = int((time.monotonic() - t0) * 1000)
                 if resp.status_code == 200:
                     try:
