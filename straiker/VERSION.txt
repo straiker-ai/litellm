@@ -1,0 +1,6 @@
+straiker-litellm-integration: 1.0.0
+litellm: 1.87.0
+image: ghcr.io/berriai/litellm:main-stable
+image-digest: sha256:75543fa1d73989b7aefba49c910989f7886f63210520e30b39dbbc580a41826f
+verified: 2026-06-01
+modes: pre_call, during_call, post_call

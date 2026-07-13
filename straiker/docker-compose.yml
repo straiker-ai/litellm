@@ -1,0 +1,58 @@
+# Local demo stack for the Straiker DefendAI native partner guardrail.
+#
+# Uses the custom image built from Dockerfile in this directory. The image
+# layers our patched litellm/ package and rebuilt admin UI on top of the
+# upstream ghcr.io/berriai/litellm base, so the admin UI shows Straiker as
+# a native partner (dropdown, form, logo) without any runtime mounts.
+#
+# Build (from this directory, using fork root as context):
+#   docker build -f Dockerfile -t ghcr.io/phimmstraiker/litellm:straiker-latest ..
+#
+# Run:
+#   export OPENAI_API_KEY=sk-...
+#   export STRAIKER_API_KEY=...
+#   docker compose up -d
+#
+# Admin UI: http://localhost:4000/ui  (login sk-1234)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: litellm-straiker-pg
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: litellm
+      POSTGRES_DB: litellm
+    volumes:
+      - litellm_pg_data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  litellm:
+    image: ghcr.io/phimmstraiker/litellm:straiker-latest
+    container_name: litellm-straiker
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "4000:4000"
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      STRAIKER_API_KEY: ${STRAIKER_API_KEY}
+      DATABASE_URL: postgresql://litellm:litellm@postgres:5432/litellm
+      STORE_MODEL_IN_DB: "true"
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-1234}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:-sk-salt-1234}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+    restart: unless-stopped
+
+volumes:
+  litellm_pg_data:
