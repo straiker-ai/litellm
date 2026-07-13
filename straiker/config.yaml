@@ -1,0 +1,88 @@
+# LiteLLM proxy config wiring up the Straiker DefendAI guardrail.
+#
+# `mode` is per-registration in LiteLLM, so the same class is registered for
+# each hook point: pre_call (blocks before request), moderation (parallel
+# during request — streaming-safe), and post_call (observability + late detection).
+#
+# `agentic`:
+#   - false: single-turn chatbot apps (calls /detect)
+#   - true:  tool-calling agent apps (calls /detect?agentic with the full
+#            messages[] including tool_calls; dedups intermediate agent iterations)
+#
+# Fault tolerance:
+#   - unreachable_fallback: "allow" (fail-open) or "block" (fail-closed) — what
+#     to do when Straiker is unreachable after all retries are exhausted.
+#   - max_retries: number of retries on transient HTTP codes (408/429/5xx) and
+#     network errors. Default 2 (3 total attempts).
+#
+# Per-route opt-out:
+#   - skip_models: list of model name patterns (glob) to bypass guardrail for.
+#     Use this for coding-agent models that have long context — Straiker IDE
+#     Hooks should be used for those workloads instead.
+#   - enabled_models: when set, only listed model patterns are scored.
+#
+# Payload guard:
+#   - max_payload_bytes: skip guardrail call if serialized payload exceeds this
+#     size (default 524288 = 512KB). Logged + bypassed.
+
+model_list:
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+guardrails:
+  - guardrail_name: straiker-pre
+    litellm_params:
+      guardrail: straiker
+      mode: pre_call
+      default_on: true
+      api_key: os.environ/STRAIKER_API_KEY
+      agentic: true
+      source: litellm-my-agent-app    # naming: litellm-{agentname} to identify LiteLLM-origin traffic in Straiker Console          # must match Straiker app name in Console
+      destination: api.openai.com
+      threshold: 0.5
+      timeout: 5.0
+      unreachable_fallback: fail_closed   # fail-closed on persistent Straiker outage
+      max_retries: 2
+      initial_backoff: 0.1
+      max_payload_bytes: 524288     # 512KB; long-context workloads bypass
+      # skip_models:                 # uncomment to bypass coding agents
+      #   - "cursor-*"
+      #   - "claude-*-coding"
+
+  - guardrail_name: straiker-moderation
+    litellm_params:
+      guardrail: straiker
+      mode: during_call             # parallel with LLM call — streaming-safe
+      default_on: false             # opt-in (some workloads only want pre_call)
+      api_key: os.environ/STRAIKER_API_KEY
+      agentic: true
+      source: litellm-my-agent-app    # naming: litellm-{agentname} to identify LiteLLM-origin traffic in Straiker Console
+      destination: api.openai.com
+      threshold: 0.5
+      timeout: 5.0
+      unreachable_fallback: fail_open   # don't block streams on transient failures
+      max_retries: 1
+
+  - guardrail_name: straiker-post
+    litellm_params:
+      guardrail: straiker
+      mode: post_call
+      default_on: true
+      api_key: os.environ/STRAIKER_API_KEY
+      agentic: true
+      source: litellm-my-agent-app    # naming: litellm-{agentname} to identify LiteLLM-origin traffic in Straiker Console
+      destination: api.openai.com
+      threshold: 0.5
+      timeout: 3.0
+      unreachable_fallback: fail_open   # post-call must never break the response
+      max_retries: 0                # observability only; one attempt is fine
+
+# Persist full prompt + response bodies so the Logs UI shows the actual
+# message[] payloads and model output (Request & Response panel). Required
+# for demoability — without this the Logs detail pane shows
+# "Request/Response Data Not Available".
+general_settings:
+  store_model_in_db: true
+  store_prompts_in_spend_logs: true
