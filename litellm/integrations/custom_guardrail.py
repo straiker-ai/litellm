@@ -136,6 +136,7 @@ def get_session_id_from_request_data(request_data: dict[str, Any]) -> str | None
 class CustomGuardrail(CustomLogger):
     # If True, during_call runs async_moderation_hook instead of the unified apply_guardrail path.
     use_native_during_call_hook: ClassVar[bool] = False
+    guardrail_provider: str | None = None
 
     # If True, every proxy lifecycle event runs this guardrail's own hooks, not apply_guardrail.
     use_native_lifecycle_hooks: ClassVar[bool] = False
@@ -1099,6 +1100,7 @@ class CustomGuardrail(CustomLogger):
             duration=duration,
             start_time=start_time,
             end_time=end_time,
+            guardrail_provider=self.guardrail_provider,
             event_type=event_type,
         )
         return response
@@ -1138,6 +1140,7 @@ class CustomGuardrail(CustomLogger):
             duration=duration,
             start_time=start_time,
             end_time=end_time,
+            guardrail_provider=self.guardrail_provider,
             event_type=event_type,
         )
         raise e

@@ -3946,15 +3946,19 @@ def _get_masked_values(
             return v[: unmasked_length // 2] + "*" * number_of_asterisks + v[-unmasked_length // 2 :]
         return v[: unmasked_length // 2] + "*" * (len(v) - unmasked_length) + v[-unmasked_length // 2 :]
 
-    return {
-        k: (
-            v
-            if ignore_sensitive_values
-            or not any(sensitive_keyword in k.lower() for sensitive_keyword in sensitive_keywords)
-            else _mask_value(v)
-        )
-        for k, v in sensitive_object.items()
-    }
+    def _masked_entry(key: str, value: Any) -> Any:
+        if ignore_sensitive_values:
+            return value
+        # Descend into nested config regardless of the parent key. Recursing only when the
+        # parent key itself looked sensitive left a secret under an innocuous key, such as a
+        # guardrail's nested provider block, returned verbatim.
+        if isinstance(value, dict):
+            return _mask_value(value)
+        if not any(sensitive_keyword in key.lower() for sensitive_keyword in sensitive_keywords):
+            return value
+        return _mask_value(value)
+
+    return {k: _masked_entry(k, v) for k, v in sensitive_object.items()}
 
 
 def set_callbacks(callback_list, function_id=None):
