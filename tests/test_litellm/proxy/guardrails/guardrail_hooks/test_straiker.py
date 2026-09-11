@@ -99,18 +99,40 @@ def test_init_rejects_invalid_fallback():
         StraikerGuardrail(api_key="k", unreachable_fallback="nope")
 
 
-def test_supported_hooks_limited_to_pre_and_post():
+def test_supported_hooks_cover_llm_and_mcp():
     from litellm.types.guardrails import GuardrailEventHooks
 
     assert StraikerGuardrail.get_supported_event_hooks() == [
         GuardrailEventHooks.pre_call,
         GuardrailEventHooks.post_call,
+        GuardrailEventHooks.pre_mcp_call,
+        GuardrailEventHooks.during_mcp_call,
+        GuardrailEventHooks.post_mcp_call,
     ]
 
 
 def test_during_call_mode_rejected_at_init():
+    """``during_call`` remains unsupported for LLM traffic.
+
+    Only its MCP sibling ``during_mcp_call`` is accepted, so this pins that adding the
+    MCP hooks did not quietly widen the LLM surface too.
+    """
     with pytest.raises(ValueError, match='Event hook GuardrailEventHooks\\.during_call is not in the'):
         StraikerGuardrail(api_key="k", event_hook="during_call")
+
+
+@pytest.mark.parametrize("mode", ["pre_mcp_call", "during_mcp_call", "post_mcp_call"])
+def test_mcp_modes_accepted_at_init(mode):
+    """Without the MCP hooks declared, ``_validate_event_hook`` rejects these modes.
+
+    The proxy rewrites the event to ``pre_mcp_call`` before comparing it against this
+    list (``proxy/utils.py:1641``), and ``init_guardrails`` catches the resulting
+    ValueError and starts the proxy *without* the guardrail rather than failing. So a
+    missing entry here does not surface as a crash -- it surfaces as MCP tool calls
+    going unscanned with a single ERROR line in the log. Hence the explicit test.
+    """
+    guardrail = StraikerGuardrail(api_key="k", event_hook=mode)
+    assert guardrail.event_hook == mode
 
 
 def test_streaming_attrs_hardcoded_to_buffered():
