@@ -278,6 +278,19 @@ class StraikerGuardrail(CustomGuardrail):
         return [
             GuardrailEventHooks.pre_call,
             GuardrailEventHooks.post_call,
+            # MCP tool calls reach this guardrail through the same unified
+            # ``apply_guardrail`` seam as LLM traffic: the MCP translation handler
+            # flattens tool arguments into ``inputs.texts`` on the way in and tool
+            # output on the way out, so no new scanning code is required.
+            #
+            # These three have to be declared even so. ``_validate_event_hook``
+            # rejects any ``mode`` not in this list, and the proxy has already
+            # rewritten the event to ``pre_mcp_call`` before the comparison
+            # (proxy/utils.py:1641) -- so without them ``mode: pre_mcp_call``
+            # raises at startup and there is no way to put Straiker on MCP traffic.
+            GuardrailEventHooks.pre_mcp_call,
+            GuardrailEventHooks.during_mcp_call,
+            GuardrailEventHooks.post_mcp_call,
         ]
 
     def __init__(
