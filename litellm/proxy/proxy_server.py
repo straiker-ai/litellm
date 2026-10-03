@@ -335,6 +335,7 @@ from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.openai_like.model_info import MODEL_INFO_REFRESH_SECONDS
 from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
 from litellm.proxy._experimental.mcp_server.byok_credential_cache import byok_credential_cache
+from litellm.proxy._experimental.mcp_server.stdio_gate import MCP_STDIO_ENABLED_ENV_VAR, is_mcp_stdio_flag_key
 from litellm.proxy._lazy_features import attach_lazy_features, reserve_lazy_slot
 from litellm.proxy._types import *
 from litellm.proxy.analytics_endpoints.analytics_endpoints import (
@@ -776,6 +777,9 @@ from litellm.proxy.shutdown.scheduled_jobs import (
     pause_scheduled_jobs,
     stop_in_flight_scheduler_jobs,
 )
+from litellm.proxy.spend_tracking.background_interaction_settlement import (
+    install_background_interaction_settlement,
+)
 from litellm.proxy.spend_tracking.budget_reservation import (
     get_budget_window_start,
     release_unbound_budget_reservation,
@@ -858,6 +862,7 @@ from litellm.secret_managers.main import (
     secret_manager_would_be_consulted,
     str_to_bool,
 )
+from litellm.tracing.config import is_clickhouse_tracing_enabled
 from litellm.types.integrations.slack_alerting import AlertType, SlackAlertingArgs
 from litellm.types.llms.anthropic import (
     AnthropicMessagesRequest,
@@ -1392,6 +1397,7 @@ async def proxy_startup_event(app: FastAPI) -> AsyncGenerator[ProxyLifespanState
                     await asyncio.sleep(5)
 
         asyncio.create_task(_run_agent_grant_id_migration())
+        await install_background_interaction_settlement(prisma_client)
 
     ## A coordination_redis block saved from the admin UI lives in the database,
     ## which is only reachable once the prisma client exists. Apply it here, before
@@ -1567,11 +1573,15 @@ async def proxy_startup_event(app: FastAPI) -> AsyncGenerator[ProxyLifespanState
 
         register_scheduled_sync(scheduler)
 
-    tracing_settings: Final = general_settings.get("tracing")
-    tracing_enabled: Final = TypeAdapter(bool).validate_python(
-        isinstance(tracing_settings, dict) and tracing_settings.get("store") == "clickhouse"
+    tracing_settings: Final = cast(  # cast-ok: Pydantic validates the legacy untyped settings value
+        dict[str, object] | None,
+        TypeAdapter(dict[str, object] | None).validate_python(general_settings.get("tracing")),
     )
-    async with manage_tracing(enabled=tracing_enabled) as receiver:
+    tracing_enabled: Final = is_clickhouse_tracing_enabled(tracing_settings)
+    async with manage_tracing(
+        enabled=tracing_enabled,
+        settings=tracing_settings,
+    ) as receiver:
         state: Final[ProxyLifespanState] = {"tracing_receiver": receiver}
         yield state
 
@@ -5402,6 +5412,7 @@ class ProxyConfig:
         self._last_cyberark_config: dict[str, object] | None = None  # mutable-ok: change-detection cache
         self._last_cleanup_schedule_attempt: tuple[object, ...] | None = None
         self._cleanup_reschedule_failed: bool = False
+        self._warned_db_mcp_stdio_flag_ignored: bool = False
         self._cyberark_boot_env: dict[str, str | None] | None = None  # mutable-ok: deployment env snapshot, set once
         self.worker_registry: list[WorkerRegistryEntry] = []
         self.config_sync_subscriber: ConfigSyncSubscriber | None = None
@@ -6184,6 +6195,12 @@ class ProxyConfig:
             for key, value in environment_variables.items():
                 if key in self._BLOCKED_ENV_KEYS:
                     verbose_proxy_logger.warning("Skipping blocked environment variable key: %s", key)
+                    continue
+                if isinstance(key, str) and is_mcp_stdio_flag_key(key):
+                    verbose_proxy_logger.warning(
+                        "Ignoring %s set in the config file. Set it in the proxy's environment instead",
+                        MCP_STDIO_ENABLED_ENV_VAR,
+                    )
                     continue
                 #########################################################
                 # handles this scenario:
@@ -7586,6 +7603,14 @@ class ProxyConfig:
         """
         decrypted_env_vars: Final = {}
         for k, v in environment_variables.items():
+            if isinstance(k, str) and is_mcp_stdio_flag_key(k):
+                if not self._warned_db_mcp_stdio_flag_ignored:
+                    verbose_proxy_logger.warning(
+                        "Ignoring %s stored in the database. Set it in the proxy's environment instead",
+                        MCP_STDIO_ENABLED_ENV_VAR,
+                    )
+                    self._warned_db_mcp_stdio_flag_ignored = True
+                continue
             try:
                 decrypted_value = decrypt_value_helper(value=v, key=k, return_original_value=return_original_value)
                 if decrypted_value is not None:
@@ -8986,11 +9011,15 @@ class ProxyConfig:
 
         from litellm.proxy.search_endpoints.search_tool_registry import (
             SearchToolRegistry,
+            keep_loaded_search_tools_that_do_not_decrypt,
         )
         from litellm.router_utils.search_api_router import SearchAPIRouter
 
         try:
-            db_search_tools: Final = await SearchToolRegistry.get_all_search_tools_from_db(prisma_client=prisma_client)
+            db_search_tools: Final = keep_loaded_search_tools_that_do_not_decrypt(
+                await SearchToolRegistry.get_all_search_tools_from_db(prisma_client=prisma_client),
+                loaded_search_tools=llm_router.search_tools if llm_router is not None else (),
+            )
 
             parsed_tools: Final = self.parse_search_tools(self.get_config_state())
             config_search_tools: Final = parsed_tools or []
@@ -9438,12 +9467,17 @@ def _restamp_streaming_chunk_model(
         )
         model_mismatch_logged = True
 
+    # The streaming wrapper keeps these same chunk objects to assemble the response it
+    # prices, so stamp a copy for the client and leave the provider's model for pricing.
+    # The logging object stamps the same model on the assembled response after pricing it.
+    logging_obj: Final = request_data.get("litellm_logging_obj")
+    if isinstance(logging_obj, LiteLLMLoggingObj):
+        logging_obj.client_facing_stream_model = target_model
     if isinstance(chunk, dict):
-        chunk["model"] = target_model
-        return chunk, model_mismatch_logged
+        return {**chunk, "model": target_model}, model_mismatch_logged
 
     try:
-        chunk.model = target_model
+        return chunk.model_copy(update={"model": target_model}), model_mismatch_logged
     except Exception as e:
         verbose_proxy_logger.error(
             "litellm_call_id=%s: failed to override chunk.model=%r on chunk_type=%s. error=%s",
@@ -12245,6 +12279,8 @@ async def completion(
         )
         litellm_call_id: Final = request_litellm_call_id(data)
         log_llm_api_exception(e, litellm_call_id)
+        if isinstance(e, ProxyException):
+            raise with_litellm_call_id(e, litellm_call_id)
         error_msg: Final = f"{e}"
         raise ProxyException(
             message=getattr(e, "message", error_msg),
