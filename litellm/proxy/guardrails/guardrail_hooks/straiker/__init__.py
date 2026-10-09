@@ -16,6 +16,7 @@ class _V3Routing(BaseModel):
     agent_ref: str | None = None
     client: str | None = None
     format_hint: Literal["anthropic.messages", "openai.chat"] | None = None
+    agent_from: list[str] | str | None = None
 
 
 _OPTIONAL_INIT_FIELDS: Final = (
@@ -61,7 +62,7 @@ def initialize_guardrail(litellm_params: "LitellmParams", guardrail: "Guardrail"
     routing: Final = _V3Routing.model_validate(
         {
             field: _get_config_value(litellm_params, optional_params, field)
-            for field in ("api_version", "agent_ref", "client", "format_hint")
+            for field in ("api_version", "agent_ref", "client", "format_hint", "agent_from")
         }
     )
     _callback: Final = StraikerGuardrail(
@@ -75,6 +76,7 @@ def initialize_guardrail(litellm_params: "LitellmParams", guardrail: "Guardrail"
         agent_ref=routing.agent_ref,
         client=routing.client,
         format_hint=routing.format_hint,
+        agent_from=routing.agent_from,
         **kwargs,
     )
 

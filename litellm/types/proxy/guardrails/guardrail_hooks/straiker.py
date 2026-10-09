@@ -141,10 +141,22 @@ class StraikerGuardrailConfigModelOptionalParams(BaseModel):
     agent_ref: str | None = Field(
         default=None,
         description=(
-            "v3 only. Names the Straiker agent this route's traffic belongs to when one gateway "
-            "fronts several applications, sent as x-s6r-agent. A client-supplied x-s6r-agent header "
-            "wins. Names ONE agent, never a kind of agent: Straiker keys per-agent state on it, so "
-            "sharing a value across applications merges them into one agent."
+            "v3 only. Pins every request through this guardrail to one Straiker agent, sent as "
+            "x-s6r-agent. Wins over agent_from and over a client-supplied x-s6r-agent header. Names ONE "
+            "agent, never a kind of agent: Straiker keys per-agent state on it, so sharing a value across "
+            "applications merges them into one agent."
+        ),
+    )
+    agent_from: str | list[str] | None = Field(
+        default=None,
+        description=(
+            "v3 only. Where the agent name comes from when agent_ref is unset, first match wins. "
+            "Comma-separated, from: header (the caller's x-s6r-agent), client (Claude Code is named "
+            "'Claude (LiteLLM)'), key_alias, team_alias, key_metadata:<field>, team_metadata:<field>. "
+            "Unset: 'header, client'. Example: 'key_metadata:straiker_agent, key_alias, client' names "
+            "each app by its virtual key, so traffic stops landing in 'Autonomous (litellm)'. Coding agents "
+            "(Claude Code, Codex) are never named by a key or team source: they stay one agent per tool, "
+            "with each developer as the user. An app built on the Claude Agent SDK is an app, not Claude Code."
         ),
     )
     client: str | None = Field(

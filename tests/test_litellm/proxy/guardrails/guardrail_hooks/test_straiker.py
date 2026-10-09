@@ -2451,3 +2451,219 @@ async def test_v3_a_killswitch_block_is_not_remembered_so_restoring_it_takes_eff
         inputs={"texts": ["x"]}, request_data=_v3_conversation(turn), input_type="request", logging_obj=_logging_obj()
     )
     assert g.async_handler.post.await_count == 2
+
+
+# --- agent_from: naming the agent from what the proxy already verified ---------------------
+
+
+def _keyed_request(alias=None, key_metadata=None, team_alias=None, team_metadata=None, headers=None, **overrides):
+    """A v3 request as the proxy stamps it for a virtual key: alias, team and their metadata."""
+    data = _v3_request_data(**overrides)
+    meta = data["metadata"]
+    meta["user_api_key_alias"] = alias
+    meta["user_api_key_metadata"] = key_metadata or {}
+    meta["user_api_key_team_alias"] = team_alias
+    meta["user_api_key_team_metadata"] = team_metadata or {}
+    data["proxy_server_request"] = {"headers": dict(headers or {})}
+    return data
+
+
+async def _agent_header(g: StraikerGuardrail, data: dict) -> str | None:
+    g.async_handler.post.return_value = _v3_mock(V3_GATEWAY_ALLOW)
+    await g.apply_guardrail(
+        inputs={"texts": ["hi"]}, request_data=data, input_type="request", logging_obj=_logging_obj()
+    )
+    return _posted_headers(g).get("x-s6r-agent")
+
+
+@pytest.mark.asyncio
+async def test_v3_agent_from_names_each_app_by_its_virtual_key():
+    """One virtual key per application names the application with no client change: the
+    key's own metadata field first, then the key alias. Before agent_from, a caller that sent
+    no x-s6r-agent landed in the gateway's catch-all agent whatever key it used."""
+    g = _make_guardrail(api_key=V3_KEY, agent_from="key_metadata:straiker_agent, key_alias, client")
+
+    named = _keyed_request(alias="orders-svc", key_metadata={"straiker_agent": "Order Support Agent"})
+    assert await _agent_header(g, named) == "Order Support Agent"
+    assert await _agent_header(g, _keyed_request(alias="orders-svc")) == "orders-svc"
+    assert await _agent_header(g, _keyed_request(alias="pricing-svc")) == "pricing-svc"
+
+
+@pytest.mark.asyncio
+async def test_v3_agent_from_names_by_team_with_a_dotted_metadata_path():
+    g = _make_guardrail(api_key=V3_KEY, agent_from=["team_metadata:straiker.agent", "team_alias"])
+
+    nested = _keyed_request(alias="k1", team_alias="claims", team_metadata={"straiker": {"agent": "Claims Intake"}})
+    assert await _agent_header(g, nested) == "Claims Intake"
+    assert await _agent_header(g, _keyed_request(alias="k1", team_alias="claims")) == "claims"
+
+
+@pytest.mark.asyncio
+async def test_v3_agent_from_reads_litellm_metadata_too():
+    """/v1/messages stamps the key under `litellm_metadata`, not `metadata`."""
+    g = _make_guardrail(api_key=V3_KEY, agent_from="key_alias")
+    data = _keyed_request()
+    data["litellm_metadata"] = {"user_api_key_alias": "messages-svc"}
+    assert await _agent_header(g, data) == "messages-svc"
+
+
+@pytest.mark.asyncio
+async def test_v3_the_pin_wins_over_every_agent_from_source():
+    g = _make_guardrail(api_key=V3_KEY, agent_ref="billing-bot", agent_from="header, key_alias, team_alias")
+    data = _keyed_request(alias="orders-svc", team_alias="claims", headers={"x-s6r-agent": "checkout-bot"})
+    assert await _agent_header(g, data) == "billing-bot"
+
+
+@pytest.mark.asyncio
+async def test_v3_unset_agent_from_keeps_the_header_then_client_ladder():
+    """Upgrading changes nothing until the operator sets agent_from: a key alias alone still
+    names no agent, and the caller's header still does."""
+    g = _make_guardrail(api_key=V3_KEY)
+    assert g.agent_from == ("header", "client")
+    assert await _agent_header(g, _keyed_request(alias="orders-svc")) is None
+    spoof = _keyed_request(alias="orders-svc", headers={"x-s6r-agent": "checkout-bot"})
+    assert await _agent_header(g, spoof) == "checkout-bot"
+
+
+@pytest.mark.asyncio
+async def test_v3_a_ladder_without_header_ignores_the_callers_header():
+    """Leaving `header` out is the opt-out: a key cannot rename itself into another
+    application's agent, and a key with nothing set falls through to the catch-all."""
+    g = _make_guardrail(api_key=V3_KEY, agent_from="key_alias")
+    spoof = _keyed_request(alias="orders-svc", headers={"x-s6r-agent": "checkout-bot"})
+    assert await _agent_header(g, spoof) == "orders-svc"
+    assert await _agent_header(g, _keyed_request(headers={"x-s6r-agent": "checkout-bot"})) is None
+
+
+@pytest.mark.asyncio
+async def test_v3_the_master_key_never_names_an_agent():
+    """A master-key call carries LiteLLM's placeholder alias, which is not an application."""
+    g = _make_guardrail(api_key=V3_KEY, agent_from="key_alias")
+    assert await _agent_header(g, _keyed_request(alias="litellm_proxy_master_key")) is None
+
+
+CLAUDE_CODE_ENTRYPOINTS = (
+    "claude-cli/2.1.295 (external, cli)",
+    "claude-cli/2.1.295 (external, claude-vscode, agent-sdk/0.3.288)",
+    "claude-cli/2.1.295 (external, sdk-cli)",
+)
+SDK_APP_USER_AGENT = "claude-cli/2.1.294 (external, sdk-py, agent-sdk/0.2.165)"
+CODEX_USER_AGENT = "codex_exec/0.157.1 (Mac OS 15.6.1; arm64) unknown (codex_exec; 0.157.1)"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_agent", CLAUDE_CODE_ENTRYPOINTS)
+async def test_v3_claude_code_collapses_onto_one_agent_whatever_key_names(user_agent):
+    """A coding agent is one agent per tool and the developer is the user. No key, team or
+    metadata source renames it, or every developer's key would become its own agent; this
+    holds for every Claude Code entrypoint (terminal, VS Code, `claude -p`), even when the
+    ladder leaves out `client`."""
+    for ladder in ("key_metadata:straiker_agent, team_alias, key_alias, client", "key_alias"):
+        g = _make_guardrail(api_key=V3_KEY, agent_from=ladder)
+        headers = {**CLAUDE_CODE_HEADERS, "user-agent": user_agent}
+        named = _keyed_request(
+            alias="dana-laptop", key_metadata={"straiker_agent": "Repo Bot"}, team_alias="platform", headers=headers
+        )
+        assert await _agent_header(g, named) == "Claude (LiteLLM)"
+        assert _posted_headers(g)["x-s6r-client"] == "claude"
+
+
+@pytest.mark.asyncio
+async def test_v3_claude_code_keeps_the_callers_own_header_as_before():
+    """Unchanged from before agent_from: a Claude Code client that sends x-s6r-agent names its
+    agent (a team name), when `header` is in the ladder, as it is by default."""
+    g = _make_guardrail(api_key=V3_KEY)
+    team = _keyed_request(alias="dana-laptop", headers={**CLAUDE_CODE_HEADERS, "x-s6r-agent": "Payments Team CLI"})
+    assert await _agent_header(g, team) == "Payments Team CLI"
+
+    no_header_source = _make_guardrail(api_key=V3_KEY, agent_from="key_alias, client")
+    assert await _agent_header(no_header_source, team) == "Claude (LiteLLM)"
+
+
+@pytest.mark.asyncio
+async def test_v3_an_agent_sdk_app_is_its_own_agent_not_claude_code():
+    """An app built on the Claude Agent SDK runs Claude Code's binary with an `sdk-py` /
+    `sdk-ts` entrypoint. It is a team's own agent: named by its key, never filed under the
+    coding agent, and no coding-agent client hint is sent."""
+    g = _make_guardrail(api_key=V3_KEY, agent_from="key_metadata:straiker_agent, key_alias, client")
+    app = _keyed_request(alias="orders-svc", headers={"user-agent": SDK_APP_USER_AGENT})
+    assert await _agent_header(g, app) == "orders-svc"
+    assert "x-s6r-client" not in _posted_headers(g)
+
+    default = _make_guardrail(api_key=V3_KEY)
+    assert (
+        await _agent_header(default, _keyed_request(alias="orders-svc", headers={"user-agent": SDK_APP_USER_AGENT}))
+        is None
+    )
+    assert "x-s6r-client" not in _posted_headers(default)
+
+
+@pytest.mark.asyncio
+async def test_v3_codex_is_left_for_straiker_to_name():
+    g = _make_guardrail(api_key=V3_KEY, agent_from="key_metadata:straiker_agent, key_alias, client")
+    codex = _keyed_request(
+        alias="dana-laptop", key_metadata={"straiker_agent": "Repo Bot"}, headers={"user-agent": CODEX_USER_AGENT}
+    )
+    assert await _agent_header(g, codex) is None
+    assert "x-s6r-client" not in _posted_headers(g)
+
+
+@pytest.mark.asyncio
+async def test_v3_an_unusable_name_falls_through_to_the_next_source():
+    g = _make_guardrail(api_key=V3_KEY, agent_from="key_metadata:straiker_agent, key_alias")
+    multiline = _keyed_request(alias="orders-svc", key_metadata={"straiker_agent": "Order\nSupport"})
+    assert await _agent_header(g, multiline) == "orders-svc"
+    blank = _keyed_request(alias="orders-svc", key_metadata={"straiker_agent": "   "})
+    assert await _agent_header(g, blank) == "orders-svc"
+    not_text = _keyed_request(alias="orders-svc", key_metadata={"straiker_agent": 42})
+    assert await _agent_header(g, not_text) == "orders-svc"
+    long = _keyed_request(key_metadata={"straiker_agent": "A" * 300})
+    assert await _agent_header(g, long) == "A" * 200
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["jwt:email", "key_metadata:", "team_metadata: ", "consumer", "header, user", 42, ["header", 3], {"a": 1}],
+)
+def test_v3_agent_from_rejects_an_unknown_source_at_startup(bad):
+    with pytest.raises(ValueError, match="agent_from"):
+        _make_guardrail(api_key=V3_KEY, agent_from=bad)
+
+
+def test_v3_agent_from_accepts_a_list_or_the_ui_text_field():
+    assert _make_guardrail(api_key=V3_KEY, agent_from=" key_alias ,team_alias,, ").agent_from == (
+        "key_alias",
+        "team_alias",
+    )
+    assert _make_guardrail(api_key=V3_KEY, agent_from=["key_metadata:a.b", "client"]).agent_from == (
+        "key_metadata:a.b",
+        "client",
+    )
+    assert _make_guardrail(api_key=V3_KEY, agent_from="").agent_from == ("header", "client")
+
+
+@pytest.mark.parametrize("configured", ["key_alias, client", ["key_alias", "client"]])
+def test_v3_agent_from_is_read_from_config_and_shown_in_the_ui(configured):
+    from litellm.proxy.guardrails.guardrail_endpoints import _get_fields_from_model
+    from litellm.types.guardrails import Guardrail, LitellmParams
+
+    g = initialize_guardrail(
+        LitellmParams(guardrail="straiker", mode="pre_call", api_key=V3_KEY, agent_from=configured),
+        Guardrail(guardrail_name="straiker", litellm_params={"guardrail": "straiker", "mode": "pre_call"}),
+    )
+    assert g.agent_from == ("key_alias", "client")
+    ui_field = _get_fields_from_model(StraikerGuardrailConfigModelOptionalParams)["agent_from"]
+    assert ui_field["type"] == "string"
+    assert "key_alias" in ui_field["description"]
+
+
+@pytest.mark.asyncio
+async def test_v3_verbose_log_says_which_source_named_the_agent(monkeypatch):
+    from litellm.proxy.guardrails.guardrail_hooks.straiker import straiker as module
+
+    lines = []
+    monkeypatch.setattr(module.verbose_proxy_logger, "info", lambda message, *a, **k: lines.append(message))
+    g = _make_guardrail(api_key=V3_KEY, verbose=True, agent_from="key_alias")
+    await _agent_header(g, _keyed_request(alias="orders-svc"))
+    agent_log = next(json.loads(line) for line in lines if '"straiker.agent"' in line)
+    assert agent_log == {"event": "straiker.agent", "agent": "orders-svc", "source": "key_alias"}
