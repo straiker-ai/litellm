@@ -169,6 +169,15 @@ class StraikerGuardrailConfigModelOptionalParams(BaseModel):
             "On key conflict with request-derived metadata, these configured values win."
         ),
     )
+    send_gateway_metadata: bool | None = Field(
+        default=True,
+        description=(
+            "v3 only. Send what the proxy knows about each call (the virtual key's alias and service "
+            "account, its team, the model group, the User-Agent and the call id) to Straiker as "
+            "annotations.gateway, for attribution. IDs and names only, never the key. Straiker records "
+            "it and never scores it."
+        ),
+    )
     verbose: bool | None = Field(
         default=False,
         description="Log webhook request/response payloads and record action/turn_id in response hidden params.",

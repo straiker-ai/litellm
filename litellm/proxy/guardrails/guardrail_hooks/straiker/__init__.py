@@ -29,6 +29,7 @@ _OPTIONAL_INIT_FIELDS: Final = (
     "custom_headers",
     "metadata",
     "verbose",
+    "send_gateway_metadata",
 )
 
 

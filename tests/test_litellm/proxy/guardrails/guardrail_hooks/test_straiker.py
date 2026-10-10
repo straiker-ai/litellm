@@ -2451,3 +2451,133 @@ async def test_v3_a_killswitch_block_is_not_remembered_so_restoring_it_takes_eff
         inputs={"texts": ["x"]}, request_data=_v3_conversation(turn), input_type="request", logging_obj=_logging_obj()
     )
     assert g.async_handler.post.await_count == 2
+
+
+# --- annotations.gateway: what the proxy knows about the call, for attribution -------------
+
+
+def _app_key_request(**overrides) -> dict:
+    """A v3 request as the proxy stamps it for an application's service-account key."""
+    data = _v3_request_data(**overrides)
+    data["metadata"].update(
+        {
+            "user_api_key_alias": "claims-intake-svc",
+            "user_api_key_metadata": {"service_account_id": "claims-intake-svc"},
+            "user_api_key_team_id": "team-7f3a",
+            "user_api_key_team_alias": "claims",
+            "user_api_key_user_id": None,
+        }
+    )
+    data["proxy_server_request"] = {"headers": {"user-agent": "AsyncOpenAI/Python 1.109.1"}}
+    return data
+
+
+async def _posted_for(
+    g: StraikerGuardrail, data: dict, input_type: str = "request", inputs: dict | None = None
+) -> dict:
+    g.async_handler.post.return_value = _v3_mock(V3_GATEWAY_ALLOW)
+    await g.apply_guardrail(
+        inputs=inputs or {"texts": ["hi"]}, request_data=data, input_type=input_type, logging_obj=_logging_obj()
+    )
+    return _posted_payload(g)
+
+
+@pytest.mark.asyncio
+async def test_v3_every_call_carries_what_the_proxy_knows_about_it():
+    """The key's alias and service account, its team, the model group, the User-Agent and
+    the call id, so Straiker can attribute the call to an application. IDs and names only."""
+    from litellm._version import version as litellm_version
+
+    payload = await _posted_for(_make_guardrail(api_key=V3_KEY), _app_key_request())
+    assert payload["annotations"] == {
+        "gateway": {
+            "type": "litellm",
+            "version": litellm_version,
+            "key": {"alias": "claims-intake-svc", "service_account_id": "claims-intake-svc"},
+            "team": {"id": "team-7f3a", "alias": "claims"},
+            "model": "claude-haiku-4-5-20251001",
+            "user_agent": "AsyncOpenAI/Python 1.109.1",
+            "request_id": "call-123",
+        }
+    }
+    assert "sk-1234" not in json.dumps(payload["annotations"])
+
+
+@pytest.mark.asyncio
+async def test_v3_the_response_phase_carries_the_same_gateway_metadata():
+    g = _make_guardrail(api_key=V3_KEY, event_hook="post_call")
+    response = ModelResponse(
+        id="chatcmpl-1",
+        model="claude-haiku-4-5-20251001",
+        object="chat.completion",
+        choices=[
+            Choices(index=0, finish_reason="stop", message=Message(role="assistant", content="Claim 88 is open."))
+        ],
+    )
+    request = await _posted_for(_make_guardrail(api_key=V3_KEY), _app_key_request())
+    answer = await _posted_for(g, _app_key_request(response=response), "response", {"texts": ["Claim 88 is open."]})
+    assert answer["straiker_phase"] == "response-sync"
+    assert answer["annotations"] == request["annotations"]
+
+
+@pytest.mark.asyncio
+async def test_v3_gateway_metadata_changes_nothing_else_on_the_call():
+    """Turning it on adds `annotations` and nothing else: same body, same headers, so the
+    agent, user, session and verdict Straiker derives are what they were without it."""
+    on = _make_guardrail(api_key=V3_KEY)
+    off = _make_guardrail(api_key=V3_KEY, send_gateway_metadata=False)
+    with_meta = await _posted_for(on, _app_key_request())
+    without = await _posted_for(off, _app_key_request())
+    assert "annotations" not in without
+    assert {k: v for k, v in with_meta.items() if k != "annotations"} == without
+    assert _posted_headers(on) == _posted_headers(off)
+
+
+@pytest.mark.asyncio
+async def test_v3_the_master_key_placeholder_is_not_sent_as_a_key_name():
+    payload = await _posted_for(_make_guardrail(api_key=V3_KEY), _v3_request_data())
+    gateway = payload["annotations"]["gateway"]
+    assert "key" not in gateway
+    assert "litellm_proxy_master_key" not in json.dumps(payload["annotations"])
+
+
+@pytest.mark.asyncio
+async def test_v3_a_client_cannot_send_its_own_gateway_metadata():
+    """`annotations` is not a provider field the guardrail relays, so a client cannot claim
+    another key or team, with gateway metadata on or off."""
+    spoof = _app_key_request()
+    spoof["annotations"] = {"gateway": {"type": "litellm", "key": {"alias": "payments-svc"}}, "other": "x"}
+    on = await _posted_for(_make_guardrail(api_key=V3_KEY), spoof)
+    assert on["annotations"]["gateway"]["key"]["alias"] == "claims-intake-svc"
+    assert "other" not in on["annotations"]
+    off = await _posted_for(_make_guardrail(api_key=V3_KEY, send_gateway_metadata=False), spoof)
+    assert "annotations" not in off
+
+
+@pytest.mark.asyncio
+async def test_v3_gateway_values_are_single_line_and_bounded():
+    data = _app_key_request()
+    data["metadata"]["user_api_key_team_alias"] = "claims\nteam"
+    data["proxy_server_request"] = {"headers": {"user-agent": "x" * 400}}
+    gateway = (await _posted_for(_make_guardrail(api_key=V3_KEY), data))["annotations"]["gateway"]
+    assert gateway["team"] == {"id": "team-7f3a"}
+    assert gateway["user_agent"] == "x" * 256
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_v3_send_gateway_metadata_is_read_from_config_and_shown_in_the_ui(configured):
+    from litellm.proxy.guardrails.guardrail_endpoints import _get_fields_from_model
+    from litellm.types.guardrails import Guardrail, LitellmParams
+
+    g = initialize_guardrail(
+        LitellmParams(guardrail="straiker", mode="pre_call", api_key=V3_KEY, send_gateway_metadata=configured),
+        Guardrail(guardrail_name="straiker", litellm_params={"guardrail": "straiker", "mode": "pre_call"}),
+    )
+    assert g.send_gateway_metadata is configured
+    unset = initialize_guardrail(
+        LitellmParams(guardrail="straiker", mode="pre_call", api_key=V3_KEY),
+        Guardrail(guardrail_name="straiker", litellm_params={"guardrail": "straiker", "mode": "pre_call"}),
+    )
+    assert unset.send_gateway_metadata is True
+    field = _get_fields_from_model(StraikerGuardrailConfigModelOptionalParams)["send_gateway_metadata"]
+    assert field["type"] == "boolean" and field.get("default_value") is True

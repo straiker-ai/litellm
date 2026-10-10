@@ -594,11 +594,64 @@ def _v3_answer_json(
     return json.dumps(_frozen((("object", "chat.completion"), ("choices", (choice,)))), default=_json_default)
 
 
+_V3_GATEWAY_FIELD_MAX: Final = 200
+_V3_GATEWAY_USER_AGENT_MAX: Final = 256
+
+
+def _v3_gateway_value(value: object, limit: int = _V3_GATEWAY_FIELD_MAX) -> str | None:
+    """A value fit to send: trimmed, single-line, bounded. Anything else is left out."""
+    if not isinstance(value, str):
+        return None
+    text: Final = value.strip()
+    if not text or any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        return None
+    return text[:limit]
+
+
+def _v3_gateway_group(**fields: object) -> Mapping[str, str] | None:
+    present: Final = {name: text for name, raw in fields.items() if (text := _v3_gateway_value(raw))}
+    return MappingProxyType(present) if present else None
+
+
+def _v3_gateway_metadata(request_data: Mapping[str, object]) -> Mapping[str, object]:
+    """What the proxy knows about the call, sent as `annotations.gateway` so Straiker can
+    attribute it: the virtual key's alias and service account, its team, the model group
+    asked for, the User-Agent and LiteLLM's call id.
+
+    Facts only: nothing here names the agent or the user, which still come from `agent_ref`,
+    the caller's `x-s6r-agent`, the recognised client and the key's user exactly as before.
+    Straiker records `annotations` and never scores them. IDs and names only, never the key
+    itself; the master key's placeholder alias is not a key name and is left out.
+    """
+    meta: Final = _merged_metadata(request_data)
+    key_metadata: Final = _as_dict(meta.get("user_api_key_metadata"))
+    groups: Final = (
+        (
+            "key",
+            _v3_gateway_group(
+                alias=_real_identity(meta.get("user_api_key_alias")),
+                service_account_id=key_metadata.get("service_account_id"),
+            ),
+        ),
+        ("team", _v3_gateway_group(id=meta.get("user_api_key_team_id"), alias=meta.get("user_api_key_team_alias"))),
+        ("model", _v3_gateway_value(request_data.get("model"))),
+        (
+            "user_agent",
+            _v3_gateway_value(_request_header(request_data, "user-agent"), _V3_GATEWAY_USER_AGENT_MAX),
+        ),
+        ("request_id", _v3_gateway_value(request_data.get("litellm_call_id"))),
+    )
+    return _frozen(
+        (("type", "litellm"), ("version", litellm_version), *((name, value) for name, value in groups if value))
+    )
+
+
 def _v3_payload(
     envelope: StraikerWebhookRequest,
     inputs: GenericGuardrailAPIInputs,
     request_data: Mapping[str, object],
     input_type: Literal["request", "response"],
+    send_gateway_metadata: bool = True,
 ) -> Mapping[str, object]:
     """The /api/v3/detect body for one phase of a turn, the unified Kong plugin's contract.
 
@@ -606,7 +659,9 @@ def _v3_payload(
     it answers, `{straiker_phase, sse, model, request}`, which is how Straiker classifies a
     tool call the model just made. Straiker parses either and derives prompt, answer, agent
     and archetype from the traffic; nothing is pre-digested here. Identity and session ride
-    on both phases the way Kong sends them.
+    on both phases the way Kong sends them, and so does `annotations.gateway` (see
+    `_v3_gateway_metadata`). The provider body never carries the client's own `annotations`:
+    it is built from an allowlist that does not include them.
     """
     context: Final = envelope.context
     request_body: Final = _v3_request_body(request_data)
@@ -623,10 +678,12 @@ def _v3_payload(
     )
     session: Final = _v3_session_id(envelope, request_data, request_body)
     user: Final = _v3_user(envelope)
+    gateway: Final = _v3_gateway_metadata(request_data) if send_gateway_metadata else None
     return _frozen(
         (
             *phase,
             *((("session_id", session),) if session else ()),
+            *((("annotations", _frozen((("gateway", gateway),))),) if gateway else ()),
             *(
                 (("original", _frozen((("processed", _frozen((("Meta", _frozen((("user", user),))),))),))),)
                 if user
@@ -879,6 +936,7 @@ class StraikerGuardrail(CustomGuardrail):
         custom_headers: dict[str, str] | None = None,
         metadata: dict[str, str] | None = None,
         verbose: bool = False,
+        send_gateway_metadata: bool = True,
         async_handler: httpx.AsyncClient | None = None,
         **kwargs: object,
     ) -> None:
@@ -919,6 +977,7 @@ class StraikerGuardrail(CustomGuardrail):
         self.custom_headers = dict(custom_headers) if custom_headers else {}
         self.default_metadata = dict(metadata) if metadata else {}
         self.verbose = bool(verbose)
+        self.send_gateway_metadata = bool(send_gateway_metadata)
 
         self.streaming_end_of_stream_only = True
         self.streaming_buffer_until_moderated = True
@@ -1196,7 +1255,7 @@ class StraikerGuardrail(CustomGuardrail):
                 input_type=input_type,
                 logging_obj=logging_obj,
             )
-            payload: Final = _v3_payload(envelope, inputs, request_data, input_type)
+            payload: Final = _v3_payload(envelope, inputs, request_data, input_type, self.send_gateway_metadata)
             headers: Final = _v3_headers(request_data, self.agent_ref, self.client, self.format_hint)
             request_body: Final = _v3_request_body(request_data)
             # The memory is scoped by the session, else by the principal; a request that has
