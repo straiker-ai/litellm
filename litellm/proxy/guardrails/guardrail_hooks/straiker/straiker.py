@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import json
 import random
-import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -69,27 +68,9 @@ V3_FORMAT_HEADER: Final = "x-s6r-format"
 # from the system prompt of its main turns only; Claude Code's title and topic sidecars carry
 # other prompts and would split the session across two agents. The User-Agent is on every call.
 _V3_CLIENT_BY_USER_AGENT: Final = (("claude-cli/", "claude", "Claude"),)
-# Claude Code names its entrypoint in the User-Agent (captured 2026-10-09): `cli` (terminal),
-# `claude-vscode`, `sdk-cli` (`claude -p`). `sdk-py` / `sdk-ts` are applications a team built
-# on the Claude Agent SDK, which runs the same binary: they are the team's own agent, not
-# Claude Code, so they are not recognised as the coding agent.
-_V3_SDK_APP_ENTRYPOINTS: Final = frozenset({"sdk-py", "sdk-ts"})
-_V3_UA_ENTRYPOINT: Final = re.compile(r"\(external,\s*([\w-]+)")
-# Coding agents Straiker names itself: recognised only so that no `agent_from` source renames
-# them. Codex sends `codex_exec/0.157.1 (...)`.
-_V3_CODING_AGENT_USER_AGENTS: Final = ("codex_",)
 V3_GATEWAY_NAME: Final = "LiteLLM"
 V3_DERIVED_SESSION_PREFIX: Final = "litellm-"
 V3_AGENT_HEADER: Final = "x-s6r-agent"
-# Where the agent name comes from when no `agent_ref` is pinned, first match wins. The
-# default is the ladder before `agent_from` existed: the caller's header, then the client
-# the User-Agent names. The key and team sources are set by the proxy admin, not the caller.
-V3_AGENT_SOURCES_DEFAULT: Final = ("header", "client")
-_V3_AGENT_SOURCES: Final = frozenset({"header", "client", "key_alias", "team_alias"})
-_V3_AGENT_METADATA_SOURCES: Final = MappingProxyType(
-    {"key_metadata": "user_api_key_metadata", "team_metadata": "user_api_key_team_metadata"}
-)
-_V3_AGENT_NAME_MAX: Final = 200
 V3_RESPONSE_PHASE: Final = "response-sync"
 V3_BLOCK_DECISIONS: Final = frozenset({"block", "deny"})
 V3_BLOCKED_TURN_MEMORY: Final = 10_000
@@ -613,11 +594,64 @@ def _v3_answer_json(
     return json.dumps(_frozen((("object", "chat.completion"), ("choices", (choice,)))), default=_json_default)
 
 
+_V3_GATEWAY_FIELD_MAX: Final = 200
+_V3_GATEWAY_USER_AGENT_MAX: Final = 256
+
+
+def _v3_gateway_value(value: object, limit: int = _V3_GATEWAY_FIELD_MAX) -> str | None:
+    """A value fit to send: trimmed, single-line, bounded. Anything else is left out."""
+    if not isinstance(value, str):
+        return None
+    text: Final = value.strip()
+    if not text or any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        return None
+    return text[:limit]
+
+
+def _v3_gateway_group(**fields: object) -> Mapping[str, str] | None:
+    present: Final = {name: text for name, raw in fields.items() if (text := _v3_gateway_value(raw))}
+    return MappingProxyType(present) if present else None
+
+
+def _v3_gateway_metadata(request_data: Mapping[str, object]) -> Mapping[str, object]:
+    """What the proxy knows about the call, sent as `annotations.gateway` so Straiker can
+    attribute it: the virtual key's alias and service account, its team, the model group
+    asked for, the User-Agent and LiteLLM's call id.
+
+    Facts only: nothing here names the agent or the user, which still come from `agent_ref`,
+    the caller's `x-s6r-agent`, the recognised client and the key's user exactly as before.
+    Straiker records `annotations` and never scores them. IDs and names only, never the key
+    itself; the master key's placeholder alias is not a key name and is left out.
+    """
+    meta: Final = _merged_metadata(request_data)
+    key_metadata: Final = _as_dict(meta.get("user_api_key_metadata"))
+    groups: Final = (
+        (
+            "key",
+            _v3_gateway_group(
+                alias=_real_identity(meta.get("user_api_key_alias")),
+                service_account_id=key_metadata.get("service_account_id"),
+            ),
+        ),
+        ("team", _v3_gateway_group(id=meta.get("user_api_key_team_id"), alias=meta.get("user_api_key_team_alias"))),
+        ("model", _v3_gateway_value(request_data.get("model"))),
+        (
+            "user_agent",
+            _v3_gateway_value(_request_header(request_data, "user-agent"), _V3_GATEWAY_USER_AGENT_MAX),
+        ),
+        ("request_id", _v3_gateway_value(request_data.get("litellm_call_id"))),
+    )
+    return _frozen(
+        (("type", "litellm"), ("version", litellm_version), *((name, value) for name, value in groups if value))
+    )
+
+
 def _v3_payload(
     envelope: StraikerWebhookRequest,
     inputs: GenericGuardrailAPIInputs,
     request_data: Mapping[str, object],
     input_type: Literal["request", "response"],
+    send_gateway_metadata: bool = True,
 ) -> Mapping[str, object]:
     """The /api/v3/detect body for one phase of a turn, the unified Kong plugin's contract.
 
@@ -625,7 +659,9 @@ def _v3_payload(
     it answers, `{straiker_phase, sse, model, request}`, which is how Straiker classifies a
     tool call the model just made. Straiker parses either and derives prompt, answer, agent
     and archetype from the traffic; nothing is pre-digested here. Identity and session ride
-    on both phases the way Kong sends them.
+    on both phases the way Kong sends them, and so does `annotations.gateway` (see
+    `_v3_gateway_metadata`). The provider body never carries the client's own `annotations`:
+    it is built from an allowlist that does not include them.
     """
     context: Final = envelope.context
     request_body: Final = _v3_request_body(request_data)
@@ -642,10 +678,12 @@ def _v3_payload(
     )
     session: Final = _v3_session_id(envelope, request_data, request_body)
     user: Final = _v3_user(envelope)
+    gateway: Final = _v3_gateway_metadata(request_data) if send_gateway_metadata else None
     return _frozen(
         (
             *phase,
             *((("session_id", session),) if session else ()),
+            *((("annotations", _frozen((("gateway", gateway),))),) if gateway else ()),
             *(
                 (("original", _frozen((("processed", _frozen((("Meta", _frozen((("user", user),))),))),))),)
                 if user
@@ -777,13 +815,8 @@ def _v3_user(envelope: StraikerWebhookRequest) -> str | None:
 
 
 def _v3_client_from_user_agent(request_data: Mapping[str, object]) -> tuple[str, str] | None:
-    """`(client, agent name)` for a User-Agent this gateway recognises, else None. An app
-    built on the Claude Agent SDK carries Claude Code's User-Agent with an SDK entrypoint and
-    is not Claude Code."""
+    """`(client, agent name)` for a User-Agent this gateway recognises, else None."""
     user_agent: Final = (_request_header(request_data, "user-agent") or "").lower()
-    entrypoint: Final = _V3_UA_ENTRYPOINT.search(user_agent)
-    if entrypoint and entrypoint.group(1) in _V3_SDK_APP_ENTRYPOINTS:
-        return None
     return next(
         (
             (client, f"{display} ({V3_GATEWAY_NAME})")
@@ -794,123 +827,28 @@ def _v3_client_from_user_agent(request_data: Mapping[str, object]) -> tuple[str,
     )
 
 
-def _v3_is_coding_agent(request_data: Mapping[str, object], recognised: tuple[str, str] | None) -> bool:
-    if recognised:
-        return True
-    user_agent: Final = (_request_header(request_data, "user-agent") or "").lower()
-    return user_agent.startswith(_V3_CODING_AGENT_USER_AGENTS)
-
-
-def v3_agent_sources(value: object) -> tuple[str, ...]:
-    """The `agent_from` ladder, validated: a list, or one comma-separated string (what the
-    admin UI's text field submits). Unset or blank keeps the default ladder."""
-    if value is None:
-        return V3_AGENT_SOURCES_DEFAULT
-    entries: Final = value.split(",") if isinstance(value, str) else value
-    if not isinstance(entries, (list, tuple)) or not all(isinstance(entry, str) for entry in entries):
-        raise ValueError(f"agent_from must be a list of sources or a comma-separated string; got {value!r}")
-    sources: Final = tuple(entry.strip() for entry in entries if entry.strip())
-    for source in sources:
-        kind, colon, field = source.partition(":")
-        if source in _V3_AGENT_SOURCES or (colon and kind in _V3_AGENT_METADATA_SOURCES and field.strip()):
-            continue
-        raise ValueError(
-            f"agent_from entry {source!r} is not one of header, client, key_alias, team_alias, "
-            "key_metadata:<field>, team_metadata:<field>"
-        )
-    return sources or V3_AGENT_SOURCES_DEFAULT
-
-
-def _v3_agent_name(value: object) -> str | None:
-    """A usable agent name: trimmed, single-line, capped. Anything else names nobody."""
-    if not isinstance(value, str):
-        return None
-    name: Final = value.strip()
-    if not name or any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
-        return None
-    return name[:_V3_AGENT_NAME_MAX]
-
-
-def _metadata_field(bag: object, field: str) -> object:
-    """`field` from a key or team metadata dict: the exact key first, then a dotted path."""
-    if not isinstance(bag, Mapping):
-        return None
-    if field in bag:
-        return bag[field]
-    node: object = bag
-    for part in field.split("."):
-        if not isinstance(node, Mapping):
-            return None
-        node = node.get(part)
-    return node
-
-
-def _v3_agent_from_source(
-    request_data: Mapping[str, object], source: str, recognised: tuple[str, str] | None
-) -> str | None:
-    if source == "header":
-        return _v3_agent_name(_request_header(request_data, V3_AGENT_HEADER))
-    if source == "client":
-        return recognised[1] if recognised else None
-    meta: Final = _merged_metadata(request_data)
-    if source == "key_alias":
-        return _v3_agent_name(_real_identity(meta.get("user_api_key_alias")))
-    if source == "team_alias":
-        return _v3_agent_name(meta.get("user_api_key_team_alias"))
-    kind, _, field = source.partition(":")
-    return _v3_agent_name(_metadata_field(meta.get(_V3_AGENT_METADATA_SOURCES[kind]), field.strip()))
-
-
-def _v3_agent(
-    request_data: Mapping[str, object],
-    agent_ref: str | None = None,
-    agent_from: tuple[str, ...] = V3_AGENT_SOURCES_DEFAULT,
-) -> tuple[str | None, str | None]:
-    """`(agent name, the source that named it)`. The pinned `agent_ref` wins.
-
-    A coding agent is ONE agent per tool, with each developer as a user, so no key, team or
-    metadata source ever names it: that would file every developer's traffic as its own
-    agent. It keeps the ladder it had before `agent_from`: the caller's own header when
-    `header` is listed, else the recognised client (`Claude (LiteLLM)`), else nothing, and
-    Straiker names it. Any other traffic takes the first `agent_from` source with a value;
-    else nothing, and Straiker files the turn under the gateway's catch-all agent.
-    """
-    if agent_ref:
-        return agent_ref, "agent_ref"
-    recognised: Final = _v3_client_from_user_agent(request_data)
-    if _v3_is_coding_agent(request_data, recognised):
-        header: Final = _v3_agent_from_source(request_data, "header", recognised) if "header" in agent_from else None
-        if header:
-            return header, "header"
-        return (recognised[1], "client") if recognised else (None, None)
-    for source in agent_from:
-        name = _v3_agent_from_source(request_data, source, recognised)
-        if name:
-            return name, source
-    return None, None
-
-
 def _v3_headers(
     request_data: Mapping[str, object],
     agent_ref: str | None = None,
     client: str | None = None,
     format_hint: str | None = None,
-    agent_from: tuple[str, ...] = V3_AGENT_SOURCES_DEFAULT,
 ) -> Mapping[str, str]:
     """Per-call routing hints, the unified Kong plugin's set. All optional.
 
-    `x-s6r-agent` names ONE application when a gateway fronts several: the guardrail's
-    `agent_ref`, else the first `agent_from` source with a value (by default the caller's own
-    header, then the agent this gateway names from the User-Agent). The operator's pin comes
-    first because the header is caller-supplied, and honouring it over a pin would let any
-    key file its traffic under another application's agent and controls. `x-s6r-client` is
-    the route's `client` config, else the client the User-Agent names. `x-s6r-format` comes
-    from config alone. Claude Code's own session header is forwarded when the client sent it,
-    which is how a coding session groups the way the native hook would.
+    `x-s6r-agent` names ONE application when a gateway fronts several: the route's
+    `agent_ref`, else the caller's own header, else the agent this gateway names from the
+    User-Agent. The operator's value comes first because the header is caller-supplied, and
+    honouring it over a pinned route would let any key file its traffic under another
+    application's agent and controls. `x-s6r-client` is the route's `client` config, else
+    the client the User-Agent names. `x-s6r-format` comes from config alone. Claude Code's own session header is
+    forwarded when the client sent it, which is how a coding session groups the way the
+    native hook would.
     """
     session: Final = _request_header(request_data, V3_SESSION_HEADER)
     recognised: Final = _v3_client_from_user_agent(request_data)
-    agent: Final = _v3_agent(request_data, agent_ref, agent_from)[0]
+    agent: Final = (
+        agent_ref or _request_header(request_data, V3_AGENT_HEADER) or (recognised[1] if recognised else None)
+    )
     named_client: Final = client or (recognised[0] if recognised else None)
     candidates: Final = (
         (V3_SESSION_HEADER, session),
@@ -987,7 +925,6 @@ class StraikerGuardrail(CustomGuardrail):
         agent_ref: str | None = None,
         client: str | None = None,
         format_hint: Literal["anthropic.messages", "openai.chat"] | None = None,
-        agent_from: list[str] | str | None = None,
         source: str = "LiteLLM Gateway",
         timeout: float = 5.0,
         max_retries: int = 2,
@@ -999,6 +936,7 @@ class StraikerGuardrail(CustomGuardrail):
         custom_headers: dict[str, str] | None = None,
         metadata: dict[str, str] | None = None,
         verbose: bool = False,
+        send_gateway_metadata: bool = True,
         async_handler: httpx.AsyncClient | None = None,
         **kwargs: object,
     ) -> None:
@@ -1017,7 +955,6 @@ class StraikerGuardrail(CustomGuardrail):
         self.api_base = api_base.rstrip("/")
         self.api_version = api_version
         self.agent_ref = _as_optional_str(agent_ref)
-        self.agent_from = v3_agent_sources(agent_from)
         self.client = _as_optional_str(client)
         if format_hint is not None and format_hint not in ("anthropic.messages", "openai.chat"):
             raise ValueError(f"format_hint must be 'anthropic.messages' or 'openai.chat'; got {format_hint!r}")
@@ -1040,6 +977,7 @@ class StraikerGuardrail(CustomGuardrail):
         self.custom_headers = dict(custom_headers) if custom_headers else {}
         self.default_metadata = dict(metadata) if metadata else {}
         self.verbose = bool(verbose)
+        self.send_gateway_metadata = bool(send_gateway_metadata)
 
         self.streaming_end_of_stream_only = True
         self.streaming_buffer_until_moderated = True
@@ -1317,13 +1255,8 @@ class StraikerGuardrail(CustomGuardrail):
                 input_type=input_type,
                 logging_obj=logging_obj,
             )
-            payload: Final = _v3_payload(envelope, inputs, request_data, input_type)
-            headers: Final = _v3_headers(request_data, self.agent_ref, self.client, self.format_hint, self.agent_from)
-            if self.verbose:
-                agent, agent_source = _v3_agent(request_data, self.agent_ref, self.agent_from)
-                verbose_proxy_logger.info(
-                    json.dumps({"event": "straiker.agent", "agent": agent, "source": agent_source})
-                )
+            payload: Final = _v3_payload(envelope, inputs, request_data, input_type, self.send_gateway_metadata)
+            headers: Final = _v3_headers(request_data, self.agent_ref, self.client, self.format_hint)
             request_body: Final = _v3_request_body(request_data)
             # The memory is scoped by the session, else by the principal; a request that has
             # neither is never remembered, so no two callers can share a block.
