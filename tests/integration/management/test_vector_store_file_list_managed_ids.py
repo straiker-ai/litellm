@@ -2,7 +2,6 @@ import base64
 import hashlib
 import json
 import re
-import signal
 import threading
 import uuid
 from collections.abc import Callable, Generator, Mapping
@@ -602,14 +601,23 @@ def test_two_different_after_values_forward_the_last_one(gateway: Gateway) -> No
         assert _ids(page) == (managed_b,), page
 
 
-@pytest.mark.parametrize("status", (401, 404, 500))
-def test_provider_errors_reach_the_caller_and_other_models_keep_mapping(gateway: Gateway, status: int) -> None:
+@pytest.mark.parametrize(
+    ("status", "expected_error_type"),
+    ((401, "authentication_error"), (404, "invalid_request_error"), (500, "internal_server_error")),
+)
+def test_provider_errors_reach_the_caller_and_other_models_keep_mapping(
+    gateway: Gateway, status: int, expected_error_type: str
+) -> None:
     message: Final = f"provider refused listing {uuid.uuid4().hex[:8]}"
     with _rig(gateway, listing=_error_listing(status, message)) as failing, _rig(gateway, "a.txt") as healthy:
         member: Final = _member(failing.scenario, failing.model, healthy.model)
         managed_a: Final = healthy.upload(member.key, "a.txt")
         failed: Final = failing.list(member.key, {"model": failing.model})
-        assert _json(failed) == _provider_error(status, message), failed.text
+        assert failed.status_code == status, failed.text
+        error: Final = object_value(_json(failed)["error"])
+        assert message in string_value(error["message"]), failed.text
+        assert error["code"] == str(status), failed.text
+        assert error["type"] == expected_error_type, failed.text
         assert len(failing.list_requests()) == 1
         assert _ids(healthy.listed(member.key)) == (managed_a,)
         liveliness: Final = gateway.request("GET", "/health/liveliness")
@@ -734,11 +742,11 @@ def test_worker_sigkill_mid_burst_leaves_the_sibling_mapping_ids(gateway: Gatewa
                 held_by: Final = MappingProxyType({pid: _open_connections_to(pid, wire.url) for pid in workers})
                 assert sum(held_by.values()) == 20, held_by
                 victim_pid, survivor_pid = sorted(workers, key=held_by.__getitem__)
-                victim: Final = psutil.Process(victim_pid)
-                victim.suspend()
-                victim.send_signal(signal.SIGKILL)
-                release.set()
-                served: Final = tuple(result for future in burst if (result := future.result()) is not None)
+                with owned.replacing_worker(victim_pid) as kill:
+                    kill.freeze()
+                    kill()
+                    release.set()
+                    served: Final = tuple(result for future in burst if (result := future.result()) is not None)
             assert held_by[survivor_pid] >= 1, held_by
             assert len(served) == held_by[survivor_pid], (held_by, len(served))
             for response in served:
