@@ -1820,6 +1820,9 @@ class OpenAIResponsesHandler(BaseTranslation):
         envelope: Final = {"type": incomplete, "response": response}
         return (*responses_so_far, envelope)
 
+    def starts_client_tool_call(self, item: object) -> bool:
+        return self._has_streamed_tool_call_events((item,))
+
     @staticmethod
     def _has_streamed_tool_call_events(responses_so_far: Sequence[object]) -> bool:
         return any(

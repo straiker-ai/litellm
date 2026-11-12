@@ -151,6 +151,8 @@ def test_litellm_streaming_hook_reads_the_flags_stream_mode_sets(stream_mode, bu
     # that never reached the hook would fail the assertion.
     assert hook.resolve_streaming_flag(g, "streaming_buffer_until_moderated", not buffered) is buffered
     assert hook.resolve_streaming_flag(g, "streaming_end_of_stream_only", False) is True
+    # Only a live stream needs its tool calls held for the verdict: a buffered one holds everything.
+    assert hook.resolve_streaming_flag(g, "streaming_hold_tool_calls", buffered) is not buffered
 
 
 def test_streaming_flags_not_configurable():
@@ -1196,6 +1198,8 @@ async def test_v3_a_blocked_prompt_is_a_reply_on_the_routes_that_can_send_one(ca
         )
     assert blocked.value.message == V3_GATEWAY_BLOCK["straiker"]["block_message"]
     assert blocked.value.status_code == 400
+    # The model was never called and a reply logs nothing, so the block asks to be logged.
+    assert blocked.value.log_as_failure is True
 
 
 @pytest.mark.parametrize("call_type", [None, "aembedding", "agenerate_content", "acompletion"])
