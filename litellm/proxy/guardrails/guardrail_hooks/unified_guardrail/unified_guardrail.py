@@ -1175,6 +1175,9 @@ class UnifiedLLMGuardrails(CustomLogger):
             "streaming_buffer_until_moderated", buffer_until_moderated_default
         )
         release_on_scan: Final = _streaming_setting("streaming_buffer_release_on_scan", False)
+        # With a live stream scanned once at its end, also hold everything from the first tool call
+        # the client would run, so a blocked tool call never reaches the client. Text before it stays live.
+        hold_tool_calls: Final = bool(_streaming_setting("streaming_hold_tool_calls", False))
 
         if (
             buffer_until_moderated
@@ -1305,7 +1308,11 @@ class UnifiedLLMGuardrails(CustomLogger):
                         stream_has_ended = hasattr(
                             endpoint_translation, "_check_streaming_has_ended"
                         ) and endpoint_translation._check_streaming_has_ended(responses_so_far)
-                        if pending_end_of_stream_items or stream_has_ended:
+                        if (
+                            pending_end_of_stream_items
+                            or stream_has_ended
+                            or (hold_tool_calls and endpoint_translation.starts_client_tool_call(item))
+                        ):
                             pending_end_of_stream_items.append(item)
                         else:
                             chunks_yielded = True

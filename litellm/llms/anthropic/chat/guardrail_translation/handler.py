@@ -2068,6 +2068,9 @@ class AnthropicMessagesHandler(BaseTranslation):
             return tuple(responses_so_far)
         return (*responses_so_far, _RELEASED_TOOL_USE_STOP)
 
+    def starts_client_tool_call(self, item: object) -> bool:
+        return bool(self._streamed_tool_use_fingerprints((item,)))
+
     @classmethod
     def _streamed_tool_use_fingerprints(cls, responses_so_far: Sequence[object]) -> tuple[str, ...]:
         return tuple(
